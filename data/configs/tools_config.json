@@ -1,0 +1,38 @@
+{
+  "utils": {
+    "network_checker": {
+      "dns_servers": ["8.8.8.8", "114.114.114.114", "1.1.1.1"],
+      "timeout": 3
+    },
+    "retry": {
+      "default_max_attempts": 3,
+      "default_delay": 1.0,
+      "backoff_factor": 2.0,
+      "jitter": true
+    },
+    "pool": {
+      "default_max_workers": 8,
+      "queue_size": 100
+    }
+  },
+  "monitoring": {
+    "system": {
+      "history_size": 2880,
+      "cpu_warning_threshold": 75,
+      "cpu_critical_threshold": 90,
+      "memory_warning_threshold": 85,
+      "memory_critical_threshold": 95,
+      "disk_warning_threshold": 85,
+      "disk_critical_threshold": 95,
+      "enable_swap": true
+    },
+    "network_probe": {
+      "interval": 60,
+      "failure_threshold": 3,
+      "persist_db": "data/monitoring.db"
+    },
+    "rtt": {
+      "stats_ddof": 0
+    }
+  }
+}

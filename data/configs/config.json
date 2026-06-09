@@ -1,0 +1,35 @@
+{
+  "log": {
+    "level": "DEBUG",
+    "console": {
+      "enabled": true,
+      "level": "DEBUG",
+      "color": true
+    },
+    "file": {
+      "enabled": true,
+      "level": "INFO",
+      "path": "logs",
+      "rotation": {
+        "max_size_mb": 100,
+        "retention_days": 30,
+        "max_total_size_mb": 1024,
+        "warning_separate": true,
+        "by_date": true,
+        "by_size": true
+      }
+    },
+    "performance": {
+      "async_enabled": true,
+      "async_queue_size": 1000
+    },
+    "console_window": true,
+    "format": {
+      "file_json": false
+    }
+  },
+  "encryption": {
+    "master_key_file": "data/secrets/master.key"
+  },
+  "api_keys_file": "data/secrets/api_keys.json"
+}

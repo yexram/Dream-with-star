@@ -1,0 +1,17 @@
+# Environments
+.venv/
+.pyc
+
+#logger
+logs/
+
+#tests
+.pytest_cache/
+__pycache__/
+/pytest.ini
+/1.py
+tests/
+
+#keys
+data/secrets/master.key
+data/secrets/api_keys.json
