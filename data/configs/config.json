@@ -2,7 +2,7 @@
   "log": {
     "level": "DEBUG",
     "console": {
-      "enabled": true,
+      "enabled": false,
       "level": "DEBUG",
       "color": true
     },
@@ -30,6 +30,23 @@
   },
   "encryption": {
     "master_key_file": "data/secrets/master.key"
+  },
+  "deepseek": {
+    "module_1": {
+      "base_url": "https://api.deepseek.com",
+      "timeout": 60,
+      "max_retries": 3,
+      "rate_limit_per_second": 5.0,
+      "save_conversations_dir": "data/conversations",
+      "save_sensitive": false,
+      "default_model": "deepseek-v4-falsh",
+      "default_temperature": 0.8,
+      "default_max_tokens": 4096,
+      "default_top_p": 1.0,
+      "default_reasoning_effort": "high",
+      "thinking_enabled": true,
+      "models_cache_ttl_seconds": 3600
+    }
   },
   "api_keys_file": "data/secrets/api_keys.json"
 }

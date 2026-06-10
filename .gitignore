@@ -15,3 +15,6 @@ tests/
 #keys
 data/secrets/master.key
 data/secrets/api_keys.json
+
+#memory
+data/conversations/

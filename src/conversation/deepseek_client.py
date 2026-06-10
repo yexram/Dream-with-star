@@ -1,207 +1,199 @@
-# src/conversation/deepseek_client.py
 """
-DeepSeek API 客户端（专业完整版）
-- 支持流式和非流式响应
-- 自动工具调用循环（支持多轮工具调用）
-- 智能重试 + 指数退避
-- 本地限速器（可选，基于令牌桶）
-- 自动保存对话记录
+DeepSeek API 专业客户端
+- 支持所有标准参数（温度、max_tokens、top_p 等）
+- 正确处理 user_id（放入 extra_body）
+- 支持流式/非流式、工具调用循环
+- 重试 + 指数退避
+- 令牌桶限流
+- 余额查询、模型列表（含缓存）
+- 错误码映射到标准异常
 """
 
 import json
 import time
-import threading
-from typing import Dict, List, Optional, Any, Callable, Generator, Union
-from pathlib import Path
-from datetime import datetime
-from openai import OpenAI
+import requests
+from typing import Dict, List, Optional, Any, Callable, Union, Generator
+from openai import OpenAI, APIError, RateLimitError as OpenAIRateLimitError, APIConnectionError
 from src.tools.logger import log_info, log_warning, log_error, log_debug
+from src.tools.config_manager import config
 from src.conversation.api_manager import key_manager
+from src.conversation.base_client import (
+    BaseLLMClient, TokenBucketLimiter, retry_on_failure, run_tool_loop
+)
+from src.conversation.exceptions import (
+    AuthenticationError, RateLimitError, InsufficientBalanceError,
+    ValidationError, ModelNotFoundError, CircuitBreakerOpenError
+)
 
 
-class TokenBucketLimiter:
-    """简单的令牌桶限速器（线程安全）"""
-    def __init__(self, rate: float, capacity: float = None):
+class DeepSeekClient(BaseLLMClient):
+    """DeepSeek API 客户端"""
+
+    def __init__(self, module_id: int):
         """
-        :param rate: 每秒产生的令牌数（例如 10 表示每秒10个请求）
-        :param capacity: 桶容量，默认为 rate
+        :param module_id: 模块标识（用于从 KeyManager 获取对应密钥）
         """
-        self.rate = rate
-        self.capacity = capacity or rate
-        self.tokens = self.capacity
-        self.last_refill = time.monotonic()
-        self._lock = threading.Lock()
-
-    def acquire(self, block: bool = True) -> bool:
-        with self._lock:
-            now = time.monotonic()
-            elapsed = now - self.last_refill
-            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
-            self.last_refill = now
-            if self.tokens >= 1:
-                self.tokens -= 1
-                return True
-            if not block:
-                return False
-            # 计算需要等待的时间
-            wait_time = (1 - self.tokens) / self.rate
-            time.sleep(wait_time)
-            # 重试一次
-            now = time.monotonic()
-            elapsed = now - self.last_refill
-            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
-            self.last_refill = now
-            if self.tokens >= 1:
-                self.tokens -= 1
-                return True
-            return False
-
-
-class DeepSeekClient:
-    def __init__(
-        self,
-        module_id: int,
-        base_url: str = "https://api.deepseek.com",
-        timeout: int = 60,
-        max_retries: int = 3,
-        save_conversations_dir: Optional[str] = "data/conversations",
-        rate_limit_per_second: float = None,  # 例如 5.0 表示每秒最多5个请求
-    ):
         self.module_id = module_id
-        self.base_url = base_url
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.save_dir = save_conversations_dir
-        if self.save_dir:
-            Path(self.save_dir).mkdir(parents=True, exist_ok=True)
-        self.limiter = TokenBucketLimiter(rate_limit_per_second) if rate_limit_per_second else None
+        # 从配置管理器读取参数
+        self.base_url = config.get(f"deepseek.module_{module_id}.base_url", "https://api.deepseek.com")
+        self.timeout = config.get(f"deepseek.module_{module_id}.timeout", 60)
+        self.max_retries = config.get(f"deepseek.module_{module_id}.max_retries", 3)
+        self.save_conversations_dir = config.get(f"deepseek.module_{module_id}.save_conversations_dir", "data/conversations")
+        rate = config.get(f"deepseek.module_{module_id}.rate_limit_per_second")
+        self.limiter = TokenBucketLimiter(rate) if rate else None
 
-    def _get_client(self, api_key: str) -> OpenAI:
+        # 模型列表缓存
+        self._models_cache = None
+        self._models_cache_time = 0
+        self.models_cache_ttl = config.get(f"deepseek.module_{module_id}.models_cache_ttl_seconds", 3600)
+
+        # 注册配置热重载回调
+        config.watch(self._on_config_change)
+
+        log_info("DeepSeekClient 初始化完成", module_id=module_id, base_url=self.base_url)
+
+    def _on_config_change(self, key_path: str, old_value: Any, new_value: Any):
+        """配置变更时的热更新处理"""
+        if key_path.startswith(f"deepseek.module_{self.module_id}"):
+            log_info("DeepSeekClient 配置已更新", key=key_path, new_value=new_value)
+            # 动态更新限流器
+            if key_path.endswith("rate_limit_per_second"):
+                self.limiter = TokenBucketLimiter(new_value) if new_value else None
+
+    def _get_openai_client(self, api_key: str) -> OpenAI:
+        """获取 OpenAI SDK 客户端实例"""
         return OpenAI(api_key=api_key, base_url=self.base_url, timeout=self.timeout)
 
-    def _should_retry(self, status_code: int) -> bool:
-        return status_code in {429, 500, 503}
+    def _map_exception(self, e: Exception) -> Exception:
+        """将 OpenAI SDK 异常映射为自定义异常"""
+        if isinstance(e, APIError):
+            status_code = getattr(e, 'status_code', None)
+            if status_code == 401:
+                return AuthenticationError(f"认证失败: {e}")
+            elif status_code == 402:
+                return InsufficientBalanceError(f"余额不足: {e}")
+            elif status_code == 422:
+                return ValidationError(f"参数错误: {e}")
+            elif status_code == 429:
+                # 尝试从响应中获取 Retry-After 和 user_id 信息
+                retry_after = None
+                is_user_level = False
+                if hasattr(e, 'response') and e.response:
+                    retry_after = e.response.headers.get('Retry-After')
+                    # DeepSeek 的 user_id 限流错误信息中可能包含 "user_id"
+                    body = e.response.json() if e.response.content else {}
+                    error_msg = body.get('error', {}).get('message', '')
+                    if 'user_id' in error_msg.lower():
+                        is_user_level = True
+                return RateLimitError(str(e), is_user_level=is_user_level, retry_after=retry_after)
+            elif status_code == 404:
+                return ModelNotFoundError(f"模型不存在: {e}")
+        elif isinstance(e, APIConnectionError):
+            return ConnectionError(f"网络连接错误: {e}")
+        return e
 
-    def _is_fatal(self, status_code: int) -> bool:
-        return status_code in {400, 401, 402, 422}
-
-    def _extract_status_code(self, exception: Exception) -> Optional[int]:
-        try:
-            if hasattr(exception, 'status_code'):
-                return exception.status_code
-            if hasattr(exception, 'response') and hasattr(exception.response, 'status_code'):
-                return exception.response.status_code
-        except:
-            pass
-        return None
-
-    def _save_conversation(self, request: Dict, response_dict: Dict):
-        if not self.save_dir:
-            return
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        filename = f"{timestamp}.json"
-        filepath = Path(self.save_dir) / filename
-        data = {
-            "timestamp": timestamp,
-            "request": request,
-            "response": response_dict
-        }
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-
+    @retry_on_failure(max_retries=3, base_delay=1.0, max_delay=10.0,
+                      exceptions=(APIError, APIConnectionError, RateLimitError))
     def chat_completion(
         self,
         messages: List[Dict],
-        model: str = "deepseek-v4-pro",
+        model: Optional[str] = None,
         user_id: Optional[str] = None,
-        reasoning_effort: Optional[str] = None,
-        thinking_enabled: bool = True,
-        tools: Optional[List[Dict]] = None,
-        tool_choice: Optional[str] = None,
         stream: bool = False,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-        extra_body: Optional[Dict] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[Union[str, List[str]]] = None,
+        tools: Optional[List[Dict]] = None,
+        tool_choice: Optional[str] = None,
+        **kwargs
     ) -> Union[Dict, Generator[Dict, None, None]]:
         """
-        非流式返回完整响应字典；流式返回生成器，每个元素是字典（增量）
+        调用 DeepSeek Chat Completions API
         """
         # 限流
         if self.limiter:
             self.limiter.acquire(block=True)
 
+        # 从配置读取默认值
+        if model is None:
+            model = config.get(f"deepseek.module_{self.module_id}.default_model", "deepseek-v4-pro")
+        if temperature is None:
+            temperature = config.get(f"deepseek.module_{self.module_id}.default_temperature", 1.0)
+        if max_tokens is None:
+            max_tokens = config.get(f"deepseek.module_{self.module_id}.default_max_tokens", 4096)
+        if top_p is None:
+            top_p = config.get(f"deepseek.module_{self.module_id}.default_top_p", 1.0)
+        reasoning_effort = config.get(f"deepseek.module_{self.module_id}.default_reasoning_effort", "high")
+        thinking_enabled = config.get(f"deepseek.module_{self.module_id}.thinking_enabled", True)
+
+        # 构建请求体
         request_body = {
             "model": model,
             "messages": messages,
             "stream": stream,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": top_p,
         }
-        if user_id:
-            request_body["user_id"] = user_id
-        if reasoning_effort:
-            request_body["reasoning_effort"] = reasoning_effort
-        if thinking_enabled:
-            if "extra_body" not in request_body:
-                request_body["extra_body"] = {}
-            request_body["extra_body"]["thinking"] = {"type": "enabled"}
+        if stop is not None:
+            request_body["stop"] = stop
         if tools:
             request_body["tools"] = tools
         if tool_choice:
             request_body["tool_choice"] = tool_choice
-        if temperature is not None:
-            request_body["temperature"] = temperature
-        if max_tokens:
-            request_body["max_tokens"] = max_tokens
+
+        # 处理 extra_body（包含 user_id、thinking 等）
+        extra_body = {}
+        if user_id:
+            extra_body["user_id"] = user_id
+        if thinking_enabled:
+            extra_body["thinking"] = {"type": "enabled"}
+        if reasoning_effort:
+            extra_body["reasoning_effort"] = reasoning_effort
+        # 合并额外参数
+        extra_body.update(kwargs.get("extra_body", {}))
         if extra_body:
-            request_body["extra_body"] = {**request_body.get("extra_body", {}), **extra_body}
+            request_body["extra_body"] = extra_body
 
-        last_exception = None
-        for attempt in range(1, self.max_retries + 1):
-            api_key = key_manager.get_next_key(self.module_id)
-            if not api_key:
-                raise RuntimeError(f"模块 {self.module_id} 无可用密钥")
+        # 获取 API key
+        api_key = key_manager.get_next_key(self.module_id)
+        if not api_key:
+            raise RuntimeError(f"模块 {self.module_id} 无可用 API key")
 
-            client = self._get_client(api_key)
-            try:
-                if stream:
-                    response = client.chat.completions.create(**request_body)
-                    # 返回生成器，但需要在这里捕获异常较难，简化：先不实现流式重试
-                    return self._stream_generator(response, request_body)
-                else:
-                    response = client.chat.completions.create(**request_body)
-                    resp_dict = self._response_to_dict(response)
-                    self._save_conversation(request_body, resp_dict)
-                    return resp_dict
-            except Exception as e:
-                status_code = self._extract_status_code(e)
-                log_warning(f"API调用失败 (attempt {attempt})", error=str(e), status_code=status_code)
-                if status_code and self._is_fatal(status_code):
-                    key_manager.mark_key_failure(self.module_id, api_key)
-                    continue  # 切换密钥重试
-                elif status_code and self._should_retry(status_code):
-                    key_manager.mark_key_failure(self.module_id, api_key)
-                    wait = min(2 ** attempt, 10)
-                    time.sleep(wait)
-                    continue
-                else:
-                    last_exception = e
-                    continue
-        raise Exception(f"经过 {self.max_retries} 次重试仍失败") from last_exception
+        client = self._get_openai_client(api_key)
+        try:
+            if stream:
+                response = client.chat.completions.create(**request_body)
+                return self._stream_generator(response, request_body)
+            else:
+                response = client.chat.completions.create(**request_body)
+                resp_dict = self._response_to_dict(response)
+                self._save_conversation(request_body, resp_dict)
+                return resp_dict
+        except Exception as e:
+            mapped = self._map_exception(e)
+            # 对于认证失败，通知 KeyManager 标记失败并重试（由装饰器处理）
+            if isinstance(mapped, AuthenticationError):
+                key_manager.mark_key_failure(self.module_id, api_key)
+            raise mapped
 
-    def _stream_generator(self, response, request_body):
-        """流式响应的生成器，同时收集完整响应用于保存"""
-        collected_chunks = []
+    def _stream_generator(self, response, request_body: Dict) -> Generator[Dict, None, None]:
+        """流式响应生成器，同时收集完整响应以便保存"""
+        chunks = []
         try:
             for chunk in response:
                 chunk_dict = self._chunk_to_dict(chunk)
-                collected_chunks.append(chunk_dict)
+                chunks.append(chunk_dict)
                 yield chunk_dict
         finally:
-            # 流结束后，尝试重建完整响应并保存（可选）
-            full_response = self._reconstruct_from_chunks(collected_chunks)
-            if full_response:
-                self._save_conversation(request_body, full_response)
+            # 流结束时保存对话
+            full_resp = self._reconstruct_from_chunks(chunks)
+            if full_resp:
+                self._save_conversation(request_body, full_resp)
 
     def _chunk_to_dict(self, chunk) -> Dict:
+        """将 OpenAI SDK 的流式块转换为字典"""
         return {
             "id": chunk.id,
             "model": chunk.model,
@@ -212,6 +204,7 @@ class DeepSeekClient:
                         "role": getattr(c.delta, "role", None),
                         "content": getattr(c.delta, "content", None),
                         "reasoning_content": getattr(c.delta, "reasoning_content", None),
+                        "tool_calls": getattr(c.delta, "tool_calls", None),
                     },
                     "finish_reason": c.finish_reason
                 } for c in chunk.choices
@@ -220,7 +213,7 @@ class DeepSeekClient:
         }
 
     def _reconstruct_from_chunks(self, chunks: List[Dict]) -> Optional[Dict]:
-        """从流式chunks重建完整响应（用于保存）"""
+        """从流式块重建完整响应"""
         if not chunks:
             return None
         full_content = ""
@@ -247,6 +240,7 @@ class DeepSeekClient:
         }
 
     def _response_to_dict(self, response) -> Dict:
+        """将 OpenAI SDK 的非流式响应转换为字典"""
         return {
             "id": response.id,
             "model": response.model,
@@ -275,63 +269,95 @@ class DeepSeekClient:
                 "prompt_tokens": response.usage.prompt_tokens,
                 "completion_tokens": response.usage.completion_tokens,
                 "total_tokens": response.usage.total_tokens,
-                "prompt_cache_hit_tokens": getattr(response.usage, "prompt_cache_hit_tokens", None),
-                "prompt_cache_miss_tokens": getattr(response.usage, "prompt_cache_miss_tokens", None),
             } if response.usage else None,
             "created": response.created,
         }
 
-    # ========== 高级方法：带自动工具调用循环 ==========
+    def _save_conversation(self, request: Dict, response: Dict):
+        """将对话保存到 JSON 文件（可配置是否脱敏）"""
+        if not self.save_conversations_dir:
+            return
+        from pathlib import Path
+        from datetime import datetime
+        import os
+        path = Path(self.save_conversations_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        filename = f"{timestamp}.json"
+        filepath = path / filename
+        data = {
+            "timestamp": timestamp,
+            "request": request,
+            "response": response
+        }
+        # 可选脱敏（通过配置控制）
+        if not config.get(f"deepseek.module_{self.module_id}.save_sensitive", True):
+            # 简单脱敏：移除 messages 中的 content（保留角色和工具调用结构）
+            if "messages" in data["request"]:
+                for msg in data["request"]["messages"]:
+                    if "content" in msg:
+                        msg["content"] = "[REDACTED]"
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        log_debug("对话已保存", file=str(filepath))
+
     def chat_with_tools(
         self,
         messages: List[Dict],
         tools: List[Dict],
         tool_executor: Callable[[str, Dict], str],
-        model: str = "deepseek-v4-pro",
-        user_id: Optional[str] = None,
-        reasoning_effort: Optional[str] = None,
-        thinking_enabled: bool = True,
         max_tool_rounds: int = 5,
         **kwargs
     ) -> Dict:
-        """
-        自动处理工具调用的多轮对话
-        :param tools: 工具定义列表
-        :param tool_executor: 执行工具的回调函数，签名为 (tool_name, arguments_dict) -> str
-        :param max_tool_rounds: 最多工具调用轮数，防止无限循环
-        :return: 最终的非工具响应字典
-        """
-        current_messages = messages.copy()
-        for round_num in range(1, max_tool_rounds + 1):
-            response = self.chat_completion(
-                messages=current_messages,
-                model=model,
-                user_id=user_id,
-                reasoning_effort=reasoning_effort,
-                thinking_enabled=thinking_enabled,
-                tools=tools,
-                stream=False,
-                **kwargs
-            )
-            message = response["choices"][0]["message"]
-            tool_calls = message.get("tool_calls")
-            if not tool_calls:
-                # 没有工具调用，返回最终结果
-                return response
-            # 有工具调用：添加 assistant 消息，然后执行工具并添加 tool 结果
-            current_messages.append({
-                "role": "assistant",
-                "content": message.get("content", ""),
-                "reasoning_content": message.get("reasoning_content"),
-                "tool_calls": tool_calls
-            })
-            for tc in tool_calls:
-                func_name = tc["function"]["name"]
-                args = json.loads(tc["function"]["arguments"])
-                result = tool_executor(func_name, args)
-                current_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result
-                })
-        raise Exception(f"工具调用超过最大轮数 {max_tool_rounds}")
+        """自动工具调用（委托给公共函数）"""
+        return run_tool_loop(
+            initial_messages=messages,
+            tools=tools,
+            tool_executor=tool_executor,
+            client=self,
+            max_tool_rounds=max_tool_rounds,
+            **kwargs
+        )
+
+    def get_balance(self) -> Dict:
+        """查询 DeepSeek 账户余额"""
+        api_key = key_manager.get_next_key(self.module_id)
+        if not api_key:
+            raise RuntimeError(f"模块 {self.module_id} 无可用 API key")
+        import requests
+        url = f"{self.base_url}/user/balance"
+        headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+        try:
+            resp = requests.get(url, headers=headers, timeout=self.timeout)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            log_error("查询余额失败", error=str(e))
+            raise
+
+    def list_models(self, use_cache: bool = True) -> List[Dict]:
+        """列出可用模型（带缓存）"""
+        if use_cache and self._models_cache and (time.time() - self._models_cache_time) < self.models_cache_ttl:
+            return self._models_cache
+        api_key = key_manager.get_next_key(self.module_id)
+        if not api_key:
+            raise RuntimeError(f"模块 {self.module_id} 无可用 API key")
+        import requests
+        url = f"{self.base_url}/models"
+        headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+        try:
+            resp = requests.get(url, headers=headers, timeout=self.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            models = data.get("data", [])
+            self._models_cache = models
+            self._models_cache_time = time.time()
+            return models
+        except Exception as e:
+            log_error("获取模型列表失败", error=str(e))
+            # 返回静态 fallback 列表（硬编码 DeepSeek 当前模型）
+            fallback = [
+                {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek"},
+                {"id": "deepseek-v4-flash", "object": "model", "owned_by": "deepseek"},
+            ]
+            return fallback

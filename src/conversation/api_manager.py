@@ -56,6 +56,7 @@ class WeightedRoundRobinSelector:
         self.current = -1
         self.max_weight = max(self.weights) if self.weights else 0
         self.gcd_val = self._gcd_list(self.weights)
+        self.current_weight = self.max_weight   # 修复：初始化 current_weight
 
     def _gcd_list(self, nums):
         from math import gcd
@@ -122,7 +123,6 @@ class KeyManager:
                 self.api_keys_file = Path(new)
                 self.reload()
         config.watch(on_config_change)
-        # 也可以监控 api_keys_file 本身的变化，这里简化：手动调用 reload 方法
 
     def reload(self):
         """手动重新加载密钥配置"""
@@ -182,7 +182,6 @@ class KeyManager:
         for module_id, mod in self.modules.items():
             keys_list = []
             for k in mod["keys"]:
-                # 加密明文（如果存在且没有encrypted字段）
                 encrypted = k.get("encrypted")
                 if "plain" in k and not encrypted:
                     encrypted = self.crypto.encrypt(k["plain"])
@@ -220,7 +219,6 @@ class KeyManager:
                     if k["failures"] >= 3:
                         k["enabled"] = False
                         log_warning("密钥连续失败3次，已禁用", module_id=module_id, key_id=k.get("id"))
-                    # 重建选择器
                     self._rebuild_selector(module_id)
                     self._save_to_file()
                     break

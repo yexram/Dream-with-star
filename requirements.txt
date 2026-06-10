@@ -9,6 +9,7 @@ prometheus-client>=0.17.0
 # api
 cryptography
 openai
+requests
 
 # pytest
 pytest
