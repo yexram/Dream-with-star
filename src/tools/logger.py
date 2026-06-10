@@ -513,7 +513,7 @@ class Logger:
                 self._start_log_console()
 
         # 处理独立控制台窗口
-        if self.config.get('console_window', True) and self.config['console_enabled']:
+        if self.config.get('console_window', True) and self.config['file_enabled']:
             self._start_log_console()
         else:
             self._stop_log_console()
@@ -538,7 +538,8 @@ class Logger:
             # 使用 PowerShell 的 Get-Content -Wait 实现实时 tail
             cmd = [
                 'powershell', '-Command',
-                f"Get-Content -Path '{log_file_path}' -Wait"
+                f'$Host.UI.RawUI.BufferSize = New-Object System.Management.Automation.Host.Size(5000, 9999); '
+                f'[Console]::OutputEncoding = [Text.Encoding]::UTF8; Get-Content -Path "{log_file_path}" -Encoding UTF8 -Wait'
             ]
             # 创建新进程，不继承标准输入，独立窗口
             self._console_process = subprocess.Popen(

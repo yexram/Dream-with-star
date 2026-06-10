@@ -110,8 +110,8 @@ def main():
             print(f"\n[AI]: {assistant_msg}")
 
             # 可选：如果有推理内容且需要显示，可取消注释下面一行
-            # if reasoning:
-            #     print(f"\n[推理过程]: {reasoning}")
+            if reasoning:
+                print(f"\n[推理过程]: {reasoning}")
 
             # DEBUG 输出完整响应结构（可选）
             log_debug("API 完整响应", response_id=response.get("id"), usage=response.get("usage"))
